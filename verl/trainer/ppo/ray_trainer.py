@@ -63,6 +63,7 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.feedback_generator import FeedbackRequest, build_feedback_generator
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -372,6 +373,13 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self.feedback_generator = None
+
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        if self_distillation_cfg is not None:
+            feedback_generator_cfg = self_distillation_cfg.get("feedback_generator", None)
+            if feedback_generator_cfg is not None and feedback_generator_cfg.get("enable", False):
+                self.feedback_generator = build_feedback_generator(feedback_generator_cfg)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -633,6 +641,59 @@ class RayPPOTrainer:
                     feedback_list[i] = raw_feedback[i]
         return feedback_list
 
+    def _collect_generated_feedback(
+        self,
+        batch: DataProto,
+        prompt_texts: list[str],
+        response_texts: list[str],
+    ) -> Optional[list[Any]]:
+        """
+        Collect generated feedback from the feedback generator.
+
+        Args:
+            batch: DataProto containing the batch data
+            prompt_texts: List of prompt texts for each sample in the batch
+            response_texts: List of response texts for each sample in the batch
+        """
+        if self.feedback_generator is None:
+            return None
+
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        if self_distillation_cfg is None:
+            return None
+        feedback_generator_cfg = self_distillation_cfg.get("feedback_generator", {})
+        include_ground_truth = feedback_generator_cfg.get("include_ground_truth", False)
+
+        reward_model_data = batch.non_tensor_batch.get("reward_model", None)
+        data_sources = batch.non_tensor_batch.get("data_source", None)
+
+        # Construct feedback requests for each sample in the batch
+        requests: list[FeedbackRequest] = []
+        batch_size = len(prompt_texts)
+        for i in range(batch_size):
+            ground_truth = None
+            if include_ground_truth and reward_model_data is not None and i < len(reward_model_data):
+                reward_model_item = reward_model_data[i]
+                if isinstance(reward_model_item, dict):
+                    ground_truth = reward_model_item.get("ground_truth", None)
+
+            data_source = None
+            if data_sources is not None and i < len(data_sources):
+                data_source = data_sources[i]
+
+            requests.append(
+                FeedbackRequest(
+                    question=prompt_texts[i],
+                    student_answer=response_texts[i],
+                    ground_truth=ground_truth,
+                    data_source=data_source,
+                )
+            )
+
+        # Batch generate feedback using the feedback generator
+        generated_feedback = self.feedback_generator.generate(requests)
+        return [item.feedback_text if item.feedback_text.strip() else None for item in generated_feedback]
+
     def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         uids = batch.non_tensor_batch["uid"]
@@ -687,12 +748,29 @@ class RayPPOTrainer:
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback if available and include_environment_feedback is enabled
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
+        # Extract feedback (generated feedback preferred, fallback to environment feedback)
+        feedback_source = "none"
+        feedback_list = None
+        try:
+            feedback_list = self._collect_generated_feedback(
+                batch=batch,
+                prompt_texts=prompt_texts,
+                response_texts=response_texts,
+            )
+
+            if feedback_list is not None:
+                feedback_source = "generated"
+        except Exception as e:
+            print(f"Warning: generated feedback failed, falling back to environment feedback. error={e}")
+            feedback_list = None
+
+        if feedback_list is None:
+            feedback_list = self._collect_feedback(
+                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                batch_size=batch_size,
+            )
+            feedback_source = "environment"
 
         success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
         solution_strs = [
@@ -706,6 +784,8 @@ class RayPPOTrainer:
             )
             for i in range(batch_size)
         ]
+
+        is_generated_feedback = feedback_source == "generated"
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
@@ -766,7 +846,12 @@ class RayPPOTrainer:
         # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
         feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
         feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+            feedback_list[i] is not None
+            and (
+                is_generated_feedback
+                or not feedback_only_without_solution
+                or solution_strs[i] is None
+            )
             for i in range(batch_size)
         ]
 
@@ -787,7 +872,22 @@ class RayPPOTrainer:
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "self_distillation/feedback_source_generated": 1.0 if feedback_source == "generated" else 0.0,
         }
+
+        # Add detailed teacher-context debugging information to reward_extra_infos_dict
+        # so it gets logged with rollout generations.
+        if reward_extra_infos_dict is not None:
+            reward_extra_infos_dict["self_distillation/feedback_source"] = [feedback_source] * batch_size
+            reward_extra_infos_dict["self_distillation/feedback_raw"] = [
+                "" if feedback is None else str(feedback) for feedback in feedback_list
+            ]
+            reward_extra_infos_dict["self_distillation/feedback_used"] = [bool(value) for value in feedback_used]
+            reward_extra_infos_dict["self_distillation/has_solution"] = [solution is not None for solution in solution_strs]
+            reward_extra_infos_dict["self_distillation/teacher_user_content"] = [
+                message[-1].get("content", "") if len(message) > 0 else "" for message in messages
+            ]
+
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
@@ -1639,6 +1739,7 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        print("Generating sequences (global_steps={})...".format(self.global_steps))
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
@@ -1646,6 +1747,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        print("Finished generating sequences.")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1740,6 +1842,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            print("Computing old log probabilities (global_steps={})...".format(self.global_steps))
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1762,6 +1865,8 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                            
+                            print("Finished computing old log probabilities.")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -1784,7 +1889,9 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        print("Building self-distillation batch if enabled...")
                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
+                        print("Finished building self-distillation batch.")
                         if self_distillation_data is not None:
                             self_distillation_batch, self_distillation_metrics = self_distillation_data
                             batch = batch.union(self_distillation_batch)

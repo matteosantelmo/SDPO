@@ -18,6 +18,8 @@ actor_rollout_ref:
     self_distillation:
       max_reprompt_len: 10240
       is_clip: 2.0
+      # For generated teacher feedback, override e.g.:
+      # feedback_generator.enable=True feedback_generator.model=<model_name>
     optim:
       lr: 1e-5
   rollout:

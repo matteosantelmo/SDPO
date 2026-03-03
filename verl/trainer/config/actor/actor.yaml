@@ -124,6 +124,33 @@ self_distillation:
   # Requires include_environment_feedback=True to have any effect
   environment_feedback_only_without_solution: True
 
+  # External generated feedback config (used by SDPO reprompting)
+  feedback_generator:
+    enable: False
+    backend: openai
+    model: Qwen/Qwen3-Next-80B-A3B-Thinking
+    endpoint: https://api.swissai.cscs.ch/v1
+    api_key: ""
+    api_key_env_var: CSCS_SERVING_API
+    request_timeout_seconds: 60.0
+    max_concurrent_requests: 8
+    max_retries: 3
+    initial_retry_delay_seconds: 1.0
+    max_retry_delay_seconds: 30.0
+    fail_on_error: False
+    include_ground_truth: False
+    prompt_template: |-
+      You are an expert teacher. Given a question and a student's answer, provide actionable feedback to help the student identify their mistake and improve, without leaking the final answer. Keep the feedback focused and as concise as possible.
+
+      Question:
+      {question}
+
+      Student answer:
+      {student_answer}
+
+      {ground_truth_block}Feedback:
+    generation_kwargs: {}
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

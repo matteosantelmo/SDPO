@@ -2,10 +2,10 @@ defaults:
   - _self_
 
 vars:
-  dir: /users/${oc.env:USER}/SDPO
+  dir: /iopsstor/scratch/cscs/msantelmo/SDPO
   task: ${oc.env:TASK}
-  log_dir: /users/${oc.env:USER}/output
-  ckpt_dir: /capstor/scratch/cscs/${oc.env:USER}/ttrl_runs/${vars.task}
+  log_dir: /iopsstor/scratch/cscs/msantelmo/SDPO/output
+  ckpt_dir: /iopsstor/scratch/cscs/msantelmo/SDPO/out/${vars.task}
 
 data:
   train_files: ["${vars.dir}/${vars.task}/train.parquet"]
@@ -44,7 +44,7 @@ algorithm:
   use_kl_in_reward: False
 
 custom_reward_function:
-  path: /users/${oc.env:USER}/SDPO/verl/utils/reward_score/feedback/__init__.py
+  path: /iopsstor/scratch/cscs/msantelmo/SDPO/verl/utils/reward_score/feedback/__init__.py
 
 critic:
   model:

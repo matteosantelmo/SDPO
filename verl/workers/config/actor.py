@@ -26,6 +26,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "FeedbackGeneratorConfig",
     "SelfDistillationConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
@@ -33,6 +34,66 @@ __all__ = [
     "FSDPActorConfig",
     "McoreActorConfig",
 ]
+
+
+@dataclass
+class FeedbackGeneratorConfig(BaseConfig):
+    """Configuration for generated feedback used in SDPO reprompting."""
+
+    enable: bool = False
+    backend: str = "openai"
+    model: str = ""
+    endpoint: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    api_key_env_var: str = "OPENAI_API_KEY"
+    request_timeout_seconds: float = 60.0
+    max_concurrent_requests: int = 8
+    max_retries: int = 3
+    initial_retry_delay_seconds: float = 1.0
+    max_retry_delay_seconds: float = 30.0
+    fail_on_error: bool = False
+    include_ground_truth: bool = False
+    prompt_template: str = (
+        "You are an expert teacher. Given a question and a student's answer, provide concise, actionable feedback "
+        "to help the student improve.\n\n"
+        "Question:\n{question}\n\n"
+        "Student answer:\n{student_answer}\n\n"
+        "{ground_truth_block}"
+        "Feedback:"
+    )
+
+    # Forward-compatible bag for future generation options (temperature, top_p, etc.)
+    generation_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.backend not in ["openai"]:
+            raise ValueError(f"feedback_generator.backend must be 'openai', got {self.backend}")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError(
+                f"feedback_generator.request_timeout_seconds must be positive, got {self.request_timeout_seconds}"
+            )
+        if self.max_concurrent_requests <= 0:
+            raise ValueError(
+                "feedback_generator.max_concurrent_requests must be positive, "
+                f"got {self.max_concurrent_requests}"
+            )
+        if self.max_retries < 0:
+            raise ValueError(f"feedback_generator.max_retries must be >= 0, got {self.max_retries}")
+        if self.initial_retry_delay_seconds <= 0:
+            raise ValueError(
+                "feedback_generator.initial_retry_delay_seconds must be positive, "
+                f"got {self.initial_retry_delay_seconds}"
+            )
+        if self.max_retry_delay_seconds <= 0:
+            raise ValueError(
+                "feedback_generator.max_retry_delay_seconds must be positive, "
+                f"got {self.max_retry_delay_seconds}"
+            )
+        if self.max_retry_delay_seconds < self.initial_retry_delay_seconds:
+            raise ValueError(
+                "feedback_generator.max_retry_delay_seconds must be >= "
+                "feedback_generator.initial_retry_delay_seconds"
+            )
 
 
 @dataclass
@@ -58,8 +119,7 @@ class SelfDistillationConfig(BaseConfig):
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
-        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
-        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        feedback_generator (FeedbackGeneratorConfig): Config for generated feedback from an external teacher model.
     """
 
     full_logit_distillation: bool = True
@@ -90,6 +150,7 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    feedback_generator: FeedbackGeneratorConfig = field(default_factory=FeedbackGeneratorConfig)
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

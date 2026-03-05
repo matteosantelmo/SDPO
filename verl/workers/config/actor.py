@@ -66,8 +66,11 @@ class FeedbackGeneratorConfig(BaseConfig):
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.backend not in ["openai"]:
-            raise ValueError(f"feedback_generator.backend must be 'openai', got {self.backend}")
+        if self.backend not in ["openai", "reference_based"]:
+            raise ValueError(
+                "feedback_generator.backend must be one of ['openai', 'reference_based'], "
+                f"got {self.backend}"
+            )
         if self.request_timeout_seconds <= 0:
             raise ValueError(
                 f"feedback_generator.request_timeout_seconds must be positive, got {self.request_timeout_seconds}"

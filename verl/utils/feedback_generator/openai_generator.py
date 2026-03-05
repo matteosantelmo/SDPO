@@ -26,6 +26,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
         fail_on_error: bool = False,
         prompt_template: str | None = None,
         generation_kwargs: dict[str, Any] | None = None,
+        log_prompt_sample: bool = False,
     ) -> None:
         """
         Initialize a feedback generator that calls an OpenAI-compatible chat completions API.
@@ -41,6 +42,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
             fail_on_error: If True, raise an exception if feedback generation fails for any request.
             prompt_template: Optional custom prompt template string. If not provided, a default template will be used.
             generation_kwargs: Optional dictionary for additional parameters (e.g. temperature, max_tokens).
+            log_prompt_sample: If True, print one example prompt per generate() call to stdout.
         """
         if not model:
             raise ValueError("feedback_generator.model is required for OpenAI backend")
@@ -57,6 +59,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
         self.max_retry_delay_seconds = max_retry_delay_seconds
         self.fail_on_error = fail_on_error
         self.generation_kwargs = generation_kwargs or {}
+        self.log_prompt_sample = log_prompt_sample
         self.prompt_template = prompt_template or (
             "You are an expert teacher. Given a question and a student's answer, provide concise, actionable feedback "
             "to help the student improve.\n\n"
@@ -115,6 +118,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
             fail_on_error=cfg.get("fail_on_error", False),
             prompt_template=cfg.get("prompt_template", None),
             generation_kwargs=generation_kwargs,
+            log_prompt_sample=cfg.get("log_prompt_sample", False),
         )
 
     def _build_prompt(self, req: FeedbackRequest) -> str:
@@ -224,6 +228,11 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
         if not prompts:
             self._last_generation_metrics = self._build_generation_metrics([], 0.0)
             return []
+        if self.log_prompt_sample:
+            print(
+                "[FeedbackGenerator] Example prompt (first item in batch):\n"
+                f"{prompts[0]}"
+            )
         return asyncio.run(self._generate_async(prompts))
 
     def get_last_generation_metrics(self) -> dict[str, float]:

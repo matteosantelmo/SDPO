@@ -667,6 +667,7 @@ class RayPPOTrainer:
             return None
         feedback_generator_cfg = self_distillation_cfg.get("feedback_generator", {})
         include_ground_truth = feedback_generator_cfg.get("include_ground_truth", False)
+        feedback_backend = feedback_generator_cfg.get("backend", "openai")
 
         reward_model_data = batch.non_tensor_batch.get("reward_model", None)
         data_sources = batch.non_tensor_batch.get("data_source", None)
@@ -680,10 +681,11 @@ class RayPPOTrainer:
                 continue
 
             ground_truth = None
-            if include_ground_truth and reward_model_data is not None and i < len(reward_model_data):
+            if (include_ground_truth or feedback_backend == "reference_based") and reward_model_data is not None and i < len(reward_model_data):
                 reward_model_item = reward_model_data[i]
                 if isinstance(reward_model_item, dict):
-                    ground_truth = reward_model_item.get("ground_truth", None)
+                    # If a reference answer exists, use that, otherwise, fallback to ground truth if it exists
+                    ground_truth = reward_model_item.get("reference", reward_model_item.get("ground_truth", None))
 
             data_source = None
             if data_sources is not None and i < len(data_sources):

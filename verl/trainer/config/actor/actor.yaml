@@ -4,6 +4,15 @@
 # 3. Inline comments (after a field on the same line) are not allowed.
 # 4. Indentation level is respected for nested fields.
 
+# defaults specify default config composition for this actor base config
+defaults:
+  # Feedback-generator prompt template config.
+  # Override with: actor/feedback_generator_prompt@actor_rollout_ref.actor.self_distillation.feedback_generator=<prompt_name>
+  - feedback_generator_prompt@self_distillation.feedback_generator: default_feedback_generator_prompt
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
 # Target class for this configuration
 _target_: verl.workers.config.ActorConfig
 
@@ -126,29 +135,36 @@ self_distillation:
 
   # External generated feedback config (used by SDPO reprompting)
   feedback_generator:
+
     enable: False
+
+    # Feedback backend: openai or fake_reference
     backend: openai
+
     model: Qwen/Qwen3-Next-80B-A3B-Thinking
+
     endpoint: https://api.swissai.cscs.ch/v1
+
     api_key: ""
+
     api_key_env_var: CSCS_SERVING_API
+
     request_timeout_seconds: 60.0
+
     max_concurrent_requests: 8
+
     max_retries: 3
+
     initial_retry_delay_seconds: 1.0
+
     max_retry_delay_seconds: 30.0
+
     fail_on_error: False
+
+    # Whether to provide a reference/ground-truth answer to the feedback generator.
+    # NOTE: reference_based backend always requests this data
     include_ground_truth: False
-    prompt_template: |-
-      You are an expert teacher. Given a question and a student's answer, provide actionable feedback to help the student identify their mistake and improve, without leaking the final answer. Keep the feedback focused and as concise as possible.
 
-      Question:
-      {question}
-
-      Student answer:
-      {student_answer}
-
-      {ground_truth_block}Feedback:
     generation_kwargs: {}
 
   # IS clip for loss; null disables IS weighting

@@ -1,0 +1,18 @@
+# Prompt template used by feedback generator (OpenAI backend)
+
+# Template string. Available placeholders:
+# - {question}
+# - {student_answer}
+# - {ground_truth_block}
+# - {ground_truth}
+# - {data_source}
+prompt_template: |-
+  You are an expert teacher. Given a question and a student's answer, provide actionable feedback to help the student identify their mistake and improve, without leaking the final answer. Keep the feedback focused and as concise as possible.
+
+  Question:
+  {question}
+
+  Student answer:
+  {student_answer}
+
+  {ground_truth_block}Feedback:

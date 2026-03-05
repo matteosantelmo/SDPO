@@ -889,13 +889,11 @@ class RayPPOTrainer:
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
         metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
-            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
-            "self_distillation/feedback_source_generated": 1.0 if feedback_source == "generated" else 0.0,
-            "self_distillation/feedback_generation_requested_fraction": sum(generate_feedback_mask) / batch_size,
+            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),  # Fraction of uid-groups with at least one successful sample.
+            "self_distillation/success_sample_fraction": num_with_solution / batch_size,  # Fraction of samples that have an available successful demonstration.
+            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,  # Fraction of samples with non-empty feedback available.
+            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,  # Fraction of samples where feedback is actually used in the teacher context.
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),  # Fraction of samples receiving any reprompt signal (solution and/or feedback).
         }
         if feedback_source == "generated" and self._last_feedback_generator_metrics:
             metrics.update(self._last_feedback_generator_metrics)

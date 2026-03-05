@@ -1,0 +1,26 @@
+prompt_template: |-
+  You are an expert mathematician. You will be given a problem and a high-level reference solution to the problem. Your task is to solve the problem step-by-step guided by the high-level reference solution.
+
+  # Problem
+  {question}
+  {ground_truth_block}
+  
+  A student in your class has solved the problem incorrectly. You must leverage your understanding of the reference solution to help him correct his attempt at the problem.
+
+  ### Detailed Instructions
+
+  **1. Detailed Verification Log**: You must perform a **step-by-step** check of the student's attempt against the oracle solution. This analysis will be presented in a **Detailed Verification Log**, where you justify your assessment of each substep in bullet points: for correct substeps, a brief justification suffices; for substeps with errors or gaps, you must provide a detailed explanation. You should stop once you have found the **first** critical error.
+
+  **2. Identify the First Critical Error**: For each issue in the detailed verification log, you MUST determine whether it is a **critical error**. A critical error must pass the following two checks:
+    2.1. A critical error is either a **factual error** (e.g., a calculation error like `2+3=6`) or **logical fallacy** (e.g., claiming that `A>B, C>D` implies `A-C>B-D`) that disrupts the current line of reasoning. To perform the first check, explain the specific error and state that it **invalidates the current line of reasoning**.
+    2.2. A critical error must not be recovered from. You must double-check that the error is indeed not recovered from in later steps, i.e., there does not exist a later statement that says something like "Wait, but let me double-check this claim..." and goes on to dispute the error.
+    As long as the issue passes the two checks above, it is considered a **critical error**. We are interested in the *first* critical error that the student makes.
+
+  **3. Propose An Intervention Step**: After finding the first critical error, you should propose an **intervention step** to steer the student towards the correct solution. You should frame the intervention step in a way that **does not give away the exact answer**, so that the student can still learn from the error. This intervention should locate errors and provide guidance on exactly what to try next by **showing a sketch of the next steps that will lead him to the correct solution**.
+
+  **4. Output Format**: Your response must be structured into three main sections: a **Detailed Verification Log** and an **Intervention Step**.
+    **4.1 Detailed Verification Log**: Provide the full, step-by-step verification log as defined in the Detailed Instructions, structured in bullet points. For each issue, you must provide information on where the issue is locate, a brief description of the issue, and whether or not it is a critical error.You should stop once you have found the **first** critical error. When you refer to a specific part of the student's attempt or the oracle solution, quote the relevant text.
+    **4.2 Intervention Step** Finally, you should provide a single actionable feedback as intervention step to be inserted before the occurrence of the critical error. You should specify the location in the student's attempt to insert the intervention step. **Write the content of the intervention step from the student's perspective.
+
+  # Student's Attempt
+  {student_answer}

@@ -26,7 +26,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
         fail_on_error: bool = False,
         prompt_template: str | None = None,
         generation_kwargs: dict[str, Any] | None = None,
-        log_prompt_sample: bool = False,
+        log_prompt_sample: bool = True,
     ) -> None:
         """
         Initialize a feedback generator that calls an OpenAI-compatible chat completions API.
@@ -105,6 +105,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
 
         generation_kwargs = cfg.get("generation_kwargs", None)
         generation_kwargs = dict(generation_kwargs) if generation_kwargs is not None else None
+        prompt_template = cfg.get("prompt_template", None)
 
         return OpenAIAPIFeedbackGenerator(
             model=cfg.get("model", ""),
@@ -116,7 +117,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
             initial_retry_delay_seconds=cfg.get("initial_retry_delay_seconds", 1.0),
             max_retry_delay_seconds=cfg.get("max_retry_delay_seconds", 30.0),
             fail_on_error=cfg.get("fail_on_error", False),
-            prompt_template=cfg.get("prompt_template", None),
+            prompt_template=prompt_template,
             generation_kwargs=generation_kwargs,
             log_prompt_sample=cfg.get("log_prompt_sample", False),
         )
@@ -124,7 +125,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
     def _build_prompt(self, req: FeedbackRequest) -> str:
         ground_truth_block = ""
         if req.ground_truth is not None and req.ground_truth != "":
-            ground_truth_block = f"Reference ground truth answer:\\n{req.ground_truth}\\n\\n"
+            ground_truth_block = f"# Reference Answer:\\n{req.ground_truth}\\n\\n"
         return self.prompt_template.format(
             question=req.question,
             student_answer=req.student_answer,

@@ -16,12 +16,23 @@ class FeedbackRequest:
 @dataclass
 class FeedbackResponse:
     feedback_text: str
+    completion_tokens: int = 0
+    api_attempts: int = 1
+    success: bool = True
 
 
 class AbstractFeedbackGenerator(ABC):
     @abstractmethod
     def generate(self, requests: list[FeedbackRequest]) -> list[FeedbackResponse]:
         """Generate feedback for a batch of requests."""
+
+    def get_last_generation_metrics(self) -> dict[str, float]:
+        """Return backend-specific metrics for the most recent generate() call."""
+        return {}
+
+    def get_step_relative_metrics(self, step_duration_seconds: float) -> dict[str, float]:
+        """Return optional metric measuring impact of feedback generation on step duration."""
+        return {}
 
     def close(self) -> None:
         """Optional cleanup hook for implementations with network/session resources."""

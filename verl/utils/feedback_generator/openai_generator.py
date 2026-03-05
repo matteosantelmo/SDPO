@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import os
+import time
 from typing import Any
+
+from tqdm.auto import tqdm
 
 from .base import AbstractFeedbackGenerator, FeedbackRequest, FeedbackResponse
 
@@ -63,6 +65,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
             "{ground_truth_block}"
             "Feedback:"
         )
+        self._last_generation_metrics: dict[str, float] = {}
 
         if self.max_concurrent_requests <= 0:
             raise ValueError("feedback_generator.max_concurrent_requests must be positive")
@@ -126,7 +129,7 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
             data_source=req.data_source or "",
         )
 
-    async def _call_chat_completions(self, prompt: str) -> str:
+    async def _call_chat_completions(self, prompt: str) -> FeedbackResponse:
         delay = self.initial_retry_delay_seconds
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -143,8 +146,14 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
                 content = choices[0].message.content or ""
                 if isinstance(content, list):
                     content = "".join(getattr(c, "text", "") for c in content)
-                print("Generated feedback")
-                return str(content).strip()
+                usage = getattr(response, "usage", None)
+                completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                return FeedbackResponse(
+                    feedback_text=str(content).strip(),
+                    completion_tokens=completion_tokens,
+                    api_attempts=attempt + 1,
+                    success=True,
+                )
             except Exception as e:
                 last_error = e
                 if attempt >= self.max_retries:
@@ -152,31 +161,85 @@ class OpenAIAPIFeedbackGenerator(AbstractFeedbackGenerator):
                 await asyncio.sleep(min(delay, self.max_retry_delay_seconds))
                 delay = min(delay * 2, self.max_retry_delay_seconds)
 
+        if last_error is not None:
+            setattr(last_error, "feedback_attempts", self.max_retries + 1)
         raise last_error
 
-    async def _generate_async(self, prompts: list[str]) -> list[str]:
+    def _build_generation_metrics(self, responses: list[FeedbackResponse], duration_seconds: float) -> dict[str, float]:
+        requests_requested = len(responses)
+        api_requests_sent = sum(max(item.api_attempts, 1) for item in responses)
+        generated_feedback_count = sum(1 for item in responses if item.feedback_text.strip())
+        failed_feedback_count = sum(1 for item in responses if not item.success)
+        generated_tokens = sum(max(item.completion_tokens, 0) for item in responses)
+        if generated_tokens == 0:
+            generated_tokens = sum(max(len(item.feedback_text.split()), 0) for item in responses)
+
+        return {
+            "self_distillation/feedback_generator/generated_tokens": float(generated_tokens),
+            "self_distillation/feedback_generator/tokens_per_second": float(generated_tokens / max(duration_seconds, 1e-8)),
+            "self_distillation/feedback_generator/total_duration_s": float(duration_seconds),
+            "self_distillation/feedback_generator/requests_requested": float(requests_requested),
+            "self_distillation/feedback_generator/api_requests_sent": float(api_requests_sent),
+            "self_distillation/feedback_generator/generated_feedback_count": float(generated_feedback_count),
+            "self_distillation/feedback_generator/failed_feedback_count": float(failed_feedback_count),
+            "self_distillation/feedback_generator/retry_count": float(max(api_requests_sent - requests_requested, 0)),
+        }
+
+    async def _generate_async(self, prompts: list[str]) -> list[FeedbackResponse]:
         # Use a semaphore to limit concurrency of API calls
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
 
-        async def _run_one(prompt: str) -> str:
+        batch_start_time = time.perf_counter()
+
+        async def _run_one(idx: int, prompt: str) -> tuple[int, FeedbackResponse]:
             async with semaphore:
                 try:
-                    return await self._call_chat_completions(prompt)
+                    return idx, await self._call_chat_completions(prompt)
                 except Exception as e:
                     if self.fail_on_error:
                         raise
                     print(f"Warning: feedback generation failed for one sample: {e}")
-                    return ""
+                    attempts = int(getattr(e, "feedback_attempts", self.max_retries + 1))
+                    return idx, FeedbackResponse(feedback_text="", completion_tokens=0, api_attempts=attempts, success=False)
 
-        tasks = [_run_one(prompt) for prompt in prompts]
-        return await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(_run_one(idx, prompt)) for idx, prompt in enumerate(prompts)]
+        results: list[FeedbackResponse] = [FeedbackResponse(feedback_text="", success=False)] * len(prompts)
+        progress_bar = tqdm(total=len(prompts), desc="Generating feedback", unit="sample", leave=True)
+
+        try:
+            for completed_task in asyncio.as_completed(tasks):
+                idx, item = await completed_task
+                results[idx] = item
+                progress_bar.update(1)
+        finally:
+            progress_bar.close()
+
+        duration_seconds = time.perf_counter() - batch_start_time
+        self._last_generation_metrics = self._build_generation_metrics(results, duration_seconds)
+
+        return results
 
     def generate(self, requests: list[FeedbackRequest]) -> list[FeedbackResponse]:
         prompts = [self._build_prompt(req) for req in requests]
         if not prompts:
+            self._last_generation_metrics = self._build_generation_metrics([], 0.0)
             return []
-        feedback_texts = asyncio.run(self._generate_async(prompts))
-        return [FeedbackResponse(feedback_text=text) for text in feedback_texts]
+        return asyncio.run(self._generate_async(prompts))
+
+    def get_last_generation_metrics(self) -> dict[str, float]:
+        return dict(self._last_generation_metrics)
+
+    def get_step_relative_metrics(self, step_duration_seconds: float) -> dict[str, float]:
+        if step_duration_seconds <= 0:
+            return {}
+        feedback_gen_duration = self._last_generation_metrics.get("self_distillation/feedback_generator/total_duration_s", None)
+        if feedback_gen_duration is None:
+            return {}
+        ratio = float(feedback_gen_duration) / float(step_duration_seconds)
+        return {
+            "self_distillation/feedback_generator/time_fraction_of_step": ratio,
+            "self_distillation/feedback_generator/time_percent_of_step": 100.0 * ratio,
+        }
 
     def close(self) -> None:
         try:

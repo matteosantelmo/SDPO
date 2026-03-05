@@ -374,6 +374,7 @@ class RayPPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self.feedback_generator = None
+        self._last_feedback_generator_metrics: dict[str, float] = {}
 
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         if self_distillation_cfg is not None:
@@ -646,6 +647,7 @@ class RayPPOTrainer:
         batch: DataProto,
         prompt_texts: list[str],
         response_texts: list[str],
+        generate_mask: Optional[list[bool]] = None,
     ) -> Optional[list[Any]]:
         """
         Collect generated feedback from the feedback generator.
@@ -654,8 +656,10 @@ class RayPPOTrainer:
             batch: DataProto containing the batch data
             prompt_texts: List of prompt texts for each sample in the batch
             response_texts: List of response texts for each sample in the batch
+            generate_mask: Optional per-sample mask; if provided, generate feedback only for True entries
         """
         if self.feedback_generator is None:
+            self._last_feedback_generator_metrics = {}
             return None
 
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
@@ -669,8 +673,12 @@ class RayPPOTrainer:
 
         # Construct feedback requests for each sample in the batch
         requests: list[FeedbackRequest] = []
+        request_indices: list[int] = []
         batch_size = len(prompt_texts)
         for i in range(batch_size):
+            if generate_mask is not None and not generate_mask[i]:
+                continue
+
             ground_truth = None
             if include_ground_truth and reward_model_data is not None and i < len(reward_model_data):
                 reward_model_item = reward_model_data[i]
@@ -689,10 +697,22 @@ class RayPPOTrainer:
                     data_source=data_source,
                 )
             )
+            request_indices.append(i)
+
+        # No sample requires generated feedback
+        if len(requests) == 0:
+            self.feedback_generator.generate([])
+            self._last_feedback_generator_metrics = self.feedback_generator.get_last_generation_metrics()
+            return [None] * batch_size
 
         # Batch generate feedback using the feedback generator
         generated_feedback = self.feedback_generator.generate(requests)
-        return [item.feedback_text if item.feedback_text.strip() else None for item in generated_feedback]
+        self._last_feedback_generator_metrics = self.feedback_generator.get_last_generation_metrics()
+        feedback_list: list[Any] = [None] * batch_size
+        for i, item in zip(request_indices, generated_feedback, strict=True):
+            text = item.feedback_text.strip()
+            feedback_list[i] = text if text else None
+        return feedback_list
 
     def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
@@ -748,6 +768,25 @@ class RayPPOTrainer:
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
+        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+        solution_strs = [
+            self._get_solution(
+                i,
+                success_by_uid,
+                batch.non_tensor_batch["uid"],
+                response_texts,
+                self_distillation_cfg.dont_reprompt_on_self_success,
+                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+            )
+            for i in range(batch_size)
+        ]
+
+        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+        generate_feedback_mask = [
+            (not feedback_only_without_solution) or (solution_strs[i] is None)
+            for i in range(batch_size)
+        ]
+
         # Extract feedback (generated feedback preferred, fallback to environment feedback)
         feedback_source = "none"
         feedback_list = None
@@ -756,6 +795,7 @@ class RayPPOTrainer:
                 batch=batch,
                 prompt_texts=prompt_texts,
                 response_texts=response_texts,
+                generate_mask=generate_feedback_mask,
             )
 
             if feedback_list is not None:
@@ -771,21 +811,6 @@ class RayPPOTrainer:
                 batch_size=batch_size,
             )
             feedback_source = "environment"
-
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
-            )
-            for i in range(batch_size)
-        ]
-
-        is_generated_feedback = feedback_source == "generated"
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
@@ -843,15 +868,10 @@ class RayPPOTrainer:
         teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
-        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+        # Compute which samples actually use feedback
         feedback_used = [
             feedback_list[i] is not None
-            and (
-                is_generated_feedback
-                or not feedback_only_without_solution
-                or solution_strs[i] is None
-            )
+            and ((not feedback_only_without_solution) or solution_strs[i] is None)
             for i in range(batch_size)
         ]
 
@@ -873,7 +893,10 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
             "self_distillation/feedback_source_generated": 1.0 if feedback_source == "generated" else 0.0,
+            "self_distillation/feedback_generation_requested_fraction": sum(generate_feedback_mask) / batch_size,
         }
+        if feedback_source == "generated" and self._last_feedback_generator_metrics:
+            metrics.update(self._last_feedback_generator_metrics)
 
         # Add detailed teacher-context debugging information to reward_extra_infos_dict
         # so it gets logged with rollout generations.
@@ -2018,6 +2041,9 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # if feedback generator is used, compute how much time is spent on feedback generation relative to the step duration
+                if self.feedback_generator is not None:
+                    metrics.update(self.feedback_generator.get_step_relative_metrics(step_duration_seconds=timing_raw.get("step", 0.0)))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

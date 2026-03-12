@@ -511,6 +511,13 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            data_sources = batch.non_tensor_batch.get("data_source", None)
+            if data_sources is None:
+                reward_extra_infos_to_dump["data_source"] = ["unknown"] * len(inputs)
+            else:
+                reward_extra_infos_to_dump["data_source"] = (
+                    data_sources.tolist() if isinstance(data_sources, np.ndarray) else list(data_sources)
+                )
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -1025,6 +1032,7 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
+            output_token_counts = (output_ids != self.tokenizer.pad_token_id).sum(dim=-1).cpu().tolist()
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
@@ -1037,6 +1045,12 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            sample_data_sources = test_batch.non_tensor_batch.get(
+                "data_source", np.array(["unknown"] * len(test_batch.batch), dtype=object)
+            )
+            sample_data_sources = (
+                sample_data_sources.tolist() if isinstance(sample_data_sources, np.ndarray) else list(sample_data_sources)
+            )
 
             # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
@@ -1045,6 +1059,8 @@ class RayPPOTrainer:
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
+            reward_extra_infos_dict["data_source"].extend(sample_data_sources)
+            reward_extra_infos_dict["generation/num_generated_tokens"].extend(output_token_counts)
             reward_extra_info = result.get("reward_extra_info", {})
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
@@ -1096,6 +1112,9 @@ class RayPPOTrainer:
                         teacher_gen_batch.batch["prompts"], skip_special_tokens=True
                     )
                     teacher_output_ids = teacher_output_gen_batch.batch["responses"]
+                    teacher_output_token_counts = (
+                        (teacher_output_ids != self.tokenizer.pad_token_id).sum(dim=-1).cpu().tolist()
+                    )
                     teacher_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_output_ids]
 
                     teacher_eval_batch = deepcopy(test_batch)
@@ -1112,6 +1131,9 @@ class RayPPOTrainer:
                     reward_extra_infos_dict["self_distillation/teacher_prompt"].extend(teacher_prompt_texts)
                     reward_extra_infos_dict["self_distillation/teacher_output"].extend(teacher_output_texts)
                     reward_extra_infos_dict["self_distillation/teacher_score"].extend(teacher_scores)
+                    reward_extra_infos_dict["self_distillation/teacher_num_generated_tokens"].extend(
+                        teacher_output_token_counts
+                    )
                     reward_extra_infos_dict["self_distillation/teacher_eval_mask"].extend(
                         [bool(x) for x in teacher_eval_mask]
                     )
@@ -1143,7 +1165,7 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(np.asarray(sample_data_sources, dtype=object))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1220,6 +1242,19 @@ class RayPPOTrainer:
         if teacher_acc_reprompted_values:
             metric_dict["val-aux/self_distillation/teacher_acc_reprompted_mean"] = float(
                 np.mean(teacher_acc_reprompted_values)
+            )
+
+        if "generation/num_generated_tokens" in reward_extra_infos_dict and len(
+            reward_extra_infos_dict["generation/num_generated_tokens"]
+        ) > 0:
+            metric_dict["val-aux/generation/num_generated_tokens_mean"] = float(
+                np.mean(reward_extra_infos_dict["generation/num_generated_tokens"])
+            )
+        if "self_distillation/teacher_num_generated_tokens" in reward_extra_infos_dict and len(
+            reward_extra_infos_dict["self_distillation/teacher_num_generated_tokens"]
+        ) > 0:
+            metric_dict["val-aux/self_distillation/teacher_num_generated_tokens_mean"] = float(
+                np.mean(reward_extra_infos_dict["self_distillation/teacher_num_generated_tokens"])
             )
 
         return metric_dict

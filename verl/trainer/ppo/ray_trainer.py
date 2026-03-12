@@ -769,9 +769,10 @@ class RayPPOTrainer:
         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
+        use_successful_previous_attempt = self_distillation_cfg.get("use_successful_previous_attempt", True)
 
         success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
+        available_solution_strs = [
             self._get_solution(
                 i,
                 success_by_uid,
@@ -782,6 +783,10 @@ class RayPPOTrainer:
             )
             for i in range(batch_size)
         ]
+        if use_successful_previous_attempt:
+            solution_strs = available_solution_strs
+        else:
+            solution_strs = [None] * batch_size
 
         feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
         generate_feedback_mask = [
@@ -832,6 +837,9 @@ class RayPPOTrainer:
 
             # build feedback section
             feedback_section = ""
+            # TODO: avoid this override by configuring the feedback template based on the feedback generator backend
+            if self_distillation_cfg.feedback_generator.get("enable", False) and self_distillation_cfg.feedback_generator.get("backend", None) == "reference_based":
+                self_distillation_cfg.feedback_template = "\n{feedback_raw}\n"  # Override feedback template for reference-based feedback
             if use_feedback:
                 feedback_section = self_distillation_cfg.feedback_template.format(
                     feedback_raw=feedback_list[i]
@@ -866,6 +874,10 @@ class RayPPOTrainer:
             padding=True,
             truncation=True,
         )
+        teacher_prompt_input_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_attention_mask = teacher_prompt["attention_mask"].to(device)
+        teacher_prompt_position_ids = compute_position_id_with_mask(teacher_prompt_attention_mask)
+
         teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
         teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
@@ -887,10 +899,12 @@ class RayPPOTrainer:
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_with_solution_available = sum(1 for s in available_solution_strs if s is not None)
+        num_with_solution_used = sum(1 for s in solution_strs if s is not None)
         metrics = {
             "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),  # Fraction of uid-groups with at least one successful sample.
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,  # Fraction of samples that have an available successful demonstration.
+            "self_distillation/success_sample_fraction": num_with_solution_available / batch_size,  # Fraction of samples that have an available successful demonstration.
+            "self_distillation/solution_used_fraction": num_with_solution_used / batch_size,  # Fraction of samples where successful demonstrations are actually injected in teacher context.
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,  # Fraction of samples with non-empty feedback available.
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,  # Fraction of samples where feedback is actually used in the teacher context.
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),  # Fraction of samples receiving any reprompt signal (solution and/or feedback).
@@ -906,12 +920,22 @@ class RayPPOTrainer:
                 "" if feedback is None else str(feedback) for feedback in feedback_list
             ]
             reward_extra_infos_dict["self_distillation/feedback_used"] = [bool(value) for value in feedback_used]
+            reward_extra_infos_dict["self_distillation/use_successful_previous_attempt"] = [
+                bool(use_successful_previous_attempt)
+            ] * batch_size
+            reward_extra_infos_dict["self_distillation/has_solution_available"] = [
+                solution is not None for solution in available_solution_strs
+            ]
+            reward_extra_infos_dict["self_distillation/has_solution_used"] = [solution is not None for solution in solution_strs]
             reward_extra_infos_dict["self_distillation/has_solution"] = [solution is not None for solution in solution_strs]
             reward_extra_infos_dict["self_distillation/teacher_user_content"] = [
                 message[-1].get("content", "") if len(message) > 0 else "" for message in messages
             ]
 
         return DataProto.from_dict(tensors={
+            "teacher_prompt_input_ids": teacher_prompt_input_ids,
+            "teacher_prompt_attention_mask": teacher_prompt_attention_mask,
+            "teacher_prompt_position_ids": teacher_prompt_position_ids,
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
@@ -938,6 +962,8 @@ class RayPPOTrainer:
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        teacher_acc_values: list[float] = []
+        teacher_acc_reprompted_values: list[float] = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -1028,6 +1054,91 @@ class RayPPOTrainer:
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
+            evaluate_teacher_during_validation = self.config.actor_rollout_ref.actor.get(
+                "self_distillation", {}
+            ).get("evaluate_teacher_during_validation", False)
+            if evaluate_teacher_during_validation:
+                teacher_batch_and_metrics = self._maybe_build_self_distillation_batch(
+                    batch=test_batch,
+                    reward_tensor=reward_tensor,
+                    reward_extra_infos_dict=None,
+                )
+                if teacher_batch_and_metrics is not None:
+                    teacher_batch, _ = teacher_batch_and_metrics
+                    teacher_eval_mask = teacher_batch.batch["self_distillation_mask"].detach().cpu().bool().tolist()
+
+                    teacher_gen_batch = DataProto.from_dict(
+                        tensors={
+                            "prompts": teacher_batch.batch["teacher_prompt_input_ids"],
+                            "input_ids": teacher_batch.batch["teacher_prompt_input_ids"],
+                            "attention_mask": teacher_batch.batch["teacher_prompt_attention_mask"],
+                            "position_ids": teacher_batch.batch["teacher_prompt_position_ids"],
+                        },
+                        non_tensors=test_batch.non_tensor_batch,
+                        meta_info={
+                        "eos_token_id": self.tokenizer.eos_token_id,
+                        "pad_token_id": self.tokenizer.pad_token_id,
+                        "recompute_log_prob": False,
+                        "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                        "validate": True,
+                        "global_steps": self.global_steps,
+                        },
+                    )
+
+                    teacher_gen_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(teacher_gen_batch, size_divisor)
+                    if not self.async_rollout_mode:
+                        teacher_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(teacher_gen_batch_padded)
+                    else:
+                        teacher_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(teacher_gen_batch_padded)
+                    teacher_output_gen_batch = unpad_dataproto(teacher_output_gen_batch_padded, pad_size=teacher_pad_size)
+
+                    teacher_prompt_texts = self.tokenizer.batch_decode(
+                        teacher_gen_batch.batch["prompts"], skip_special_tokens=True
+                    )
+                    teacher_output_ids = teacher_output_gen_batch.batch["responses"]
+                    teacher_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_output_ids]
+
+                    teacher_eval_batch = deepcopy(test_batch)
+                    for key, value in teacher_output_gen_batch.batch.items():
+                        teacher_eval_batch.batch[key] = value
+                    teacher_result = self._compute_or_extract_reward(
+                        teacher_eval_batch,
+                        reward_fn=self.val_reward_fn,
+                        return_dict=True,
+                    )
+                    teacher_reward_extra_info = teacher_result.get("reward_extra_info", {})
+                    teacher_scores = teacher_result["reward_tensor"].sum(-1).cpu().tolist()
+
+                    reward_extra_infos_dict["self_distillation/teacher_prompt"].extend(teacher_prompt_texts)
+                    reward_extra_infos_dict["self_distillation/teacher_output"].extend(teacher_output_texts)
+                    reward_extra_infos_dict["self_distillation/teacher_score"].extend(teacher_scores)
+                    reward_extra_infos_dict["self_distillation/teacher_eval_mask"].extend(
+                        [bool(x) for x in teacher_eval_mask]
+                    )
+
+                    teacher_acc_raw = teacher_reward_extra_info.get("acc", None)
+                    if teacher_acc_raw is not None:
+                        teacher_acc_values_batch = (
+                            teacher_acc_raw.tolist() if isinstance(teacher_acc_raw, np.ndarray) else list(teacher_acc_raw)
+                        )
+                        reward_extra_infos_dict["self_distillation/teacher_acc"].extend(teacher_acc_values_batch)
+                        teacher_acc_values.extend(float(x) for x in teacher_acc_values_batch)
+                        teacher_acc_reprompted_values.extend(
+                            float(x) for x, is_reprompted in zip(teacher_acc_values_batch, teacher_eval_mask, strict=True)
+                            if is_reprompted
+                        )
+                    else:
+                        reward_extra_infos_dict["self_distillation/teacher_acc"].extend([None] * len(teacher_output_texts))
+
+                    for key, values in teacher_reward_extra_info.items():
+                        prefixed_key = f"self_distillation/teacher_{key}"
+                        if prefixed_key in {"self_distillation/teacher_score", "self_distillation/teacher_acc"}:
+                            continue
+                        if isinstance(values, np.ndarray):
+                            reward_extra_infos_dict[prefixed_key].extend(values.tolist())
+                        else:
+                            reward_extra_infos_dict[prefixed_key].extend(values if isinstance(values, list) else [values])
+
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
@@ -1058,11 +1169,28 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "teacher_acc_values": teacher_acc_values,
+                "teacher_acc_reprompted_values": teacher_acc_reprompted_values,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            teacher_acc_values=teacher_acc_values,
+            teacher_acc_reprompted_values=teacher_acc_reprompted_values,
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        teacher_acc_values: Optional[list[float]] = None,
+        teacher_acc_reprompted_values: Optional[list[float]] = None,
+    ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1086,6 +1214,13 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if teacher_acc_values:
+            metric_dict["val-aux/self_distillation/teacher_acc_mean"] = float(np.mean(teacher_acc_values))
+        if teacher_acc_reprompted_values:
+            metric_dict["val-aux/self_distillation/teacher_acc_reprompted_mean"] = float(
+                np.mean(teacher_acc_reprompted_values)
+            )
 
         return metric_dict
 
@@ -1111,7 +1246,19 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        teacher_acc_values = result_a.get("teacher_acc_values", []) + result_b.get("teacher_acc_values", [])
+        teacher_acc_reprompted_values = result_a.get("teacher_acc_reprompted_values", []) + result_b.get(
+            "teacher_acc_reprompted_values", []
+        )
+
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            teacher_acc_values=teacher_acc_values,
+            teacher_acc_reprompted_values=teacher_acc_reprompted_values,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.

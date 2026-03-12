@@ -122,6 +122,13 @@ self_distillation:
   # Whether to not reprompt on self-success
   dont_reprompt_on_self_success: True
 
+  # Whether to include successful on-policy attempts in teacher context.
+  # Set to False to run off-policy-only teacher feedback ablations.
+  use_successful_previous_attempt: True
+
+  # Whether to evaluate the self-teacher (privileged-context generation) during validation
+  evaluate_teacher_during_validation: False
+
   # Whether to remove <think>...</think> tags from successful demonstrations before reprompting
   remove_thinking_from_demonstration: True
 

@@ -115,6 +115,8 @@ class SelfDistillationConfig(BaseConfig):
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
+        use_successful_previous_attempt (bool): Whether to include successful on-policy attempts in teacher context.
+        evaluate_teacher_during_validation (bool): Whether to run self-teacher generation/evaluation during validation.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
@@ -135,11 +137,13 @@ class SelfDistillationConfig(BaseConfig):
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
+    use_successful_previous_attempt: bool = True
+    evaluate_teacher_during_validation: bool = False
     remove_thinking_from_demonstration: bool = False
     is_clip: Optional[float] = None
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
-        "Correctly solve the original question.\n"
+        "Now, correctly answer the original question in your own words.\n"
     )
     solution_template: str = (
         "\n"

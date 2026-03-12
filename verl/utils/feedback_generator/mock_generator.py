@@ -35,8 +35,8 @@ class ReferenceBasedFeedbackGenerator(AbstractFeedbackGenerator):
                 )
             feedback = ""
             if len(reference_solution) > 0:
-                feedback += "Your solution is incorrect. The correct solution is:\n\n" 
-                feedback += reference_solution
+                feedback += "\n\nHere is a correct answer to this problem:\n" 
+                feedback += reference_solution + "\n\n"
 
             responses.append(
                 FeedbackResponse(

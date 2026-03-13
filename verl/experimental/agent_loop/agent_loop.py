@@ -923,7 +923,7 @@ class AgentLoopManager:
                 ).remote(self.config, self.server_handles, self.reward_router_address)
             )
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def _generate_sequences_impl(self, prompts: DataProto, weight_source: str = "actor") -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
@@ -933,9 +933,12 @@ class AgentLoopManager:
             DataProto: Output batch.
         """
 
+        if weight_source not in {"actor", "teacher"}:
+            raise ValueError(f"Unsupported generation weight_source={weight_source}")
+
         # Fix for Issue #4147: Always call wake_up() to ensure weight sync
         # The wake_up()/sleep() methods internally check free_cache_engine
-        self.wake_up()
+        self.wake_up(weight_source=weight_source)
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
@@ -957,7 +960,14 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        output.meta_info["generation_weight_source"] = weight_source
         return output
+
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        return self._generate_sequences_impl(prompts=prompts, weight_source="actor")
+
+    def generate_sequences_with_teacher(self, prompts: DataProto) -> DataProto:
+        return self._generate_sequences_impl(prompts=prompts, weight_source="teacher")
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
@@ -981,9 +991,9 @@ class AgentLoopManager:
 
         return timing
 
-    def wake_up(self):
+    def wake_up(self, weight_source: str = "actor"):
         """Wake up all rollout replica instances."""
-        self._run_all([replica.wake_up() for replica in self.rollout_replicas])
+        self._run_all([replica.wake_up(weight_source=weight_source) for replica in self.rollout_replicas])
 
     def sleep(self):
         """Sleep all rollout replica instances."""

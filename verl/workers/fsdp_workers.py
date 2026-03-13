@@ -675,32 +675,55 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
         # Note: sync mode is deprecated and rejected in RolloutConfig.__post_init__
 
-    async def rollout_mode(self):
-        """Context switch hybridengine to rollout mode."""
+    async def rollout_mode(self, weight_source: str = "actor"):
+        """Context switch hybridengine to rollout mode.
+
+        Args:
+            weight_source: Which module weights are pushed into rollout. Supported values:
+                - "actor": current student actor weights.
+                - "teacher": self-distillation teacher weights (EMA/ref teacher).
+        """
         aggressive_empty_cache(force_sync=True)
 
+        if weight_source not in {"actor", "teacher"}:
+            raise ValueError(f"Unsupported rollout weight_source={weight_source}")
+
+        source_module = self.actor_module_fsdp
+        if weight_source == "teacher":
+            if not self._is_actor:
+                raise ValueError("Teacher rollout weights are only available when actor is initialized.")
+            teacher_module = getattr(self.actor, "teacher_module", None)
+            if teacher_module is None:
+                raise ValueError("Teacher rollout requested but actor.teacher_module is not initialized.")
+            if hasattr(teacher_module, "ref_module") and hasattr(teacher_module, "student_module"):
+                raise ValueError(
+                    "Teacher rollout generation is not supported for trust-region teacher regularization. "
+                    "Use self_distillation.teacher_regularization=ema for teacher generation diagnostics."
+                )
+            source_module = teacher_module
+
+        source_is_actor_module = source_module is self.actor_module_fsdp
+
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
-        if self._is_offload_param:
+        if self._is_offload_param and source_is_actor_module:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
         peft_config = None
-        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        peft_model = getattr(source_module, "_fsdp_wrapped_module", source_module)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
             params = collect_lora_params(
-                module=self.actor_module_fsdp,
+                module=source_module,
                 layered_summon=self.config.rollout.get("layered_summon", False),
                 base_sync_done=self.base_sync_done,
             )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
-            params = self.actor_module_fsdp.state_dict()
+            params = source_module.state_dict()
 
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
+        params = convert_weight_keys(params, getattr(source_module, "_fsdp_wrapped_module", source_module))
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -708,17 +731,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Here: params contains LoRA weights, base_model_params contains base model weights.
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
             base_model_params = collect_lora_params(
-                module=self.actor_module_fsdp,
+                module=source_module,
                 layered_summon=self.layered_summon,
                 base_sync_done=False,
             )
             base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
-            base_model_params = convert_weight_keys(
-                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-            )
+            base_model_params = convert_weight_keys(base_model_params, getattr(source_module, "_fsdp_wrapped_module", source_module))
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-        if self._is_offload_param:
+        if self._is_offload_param and source_is_actor_module:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
@@ -976,6 +997,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
+        return self._generate_sequences_impl(prompts, use_teacher=False)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="rollout_generate_teacher")
+    def generate_sequences_with_teacher(self, prompts: DataProto):
+        return self._generate_sequences_impl(prompts, use_teacher=True)
+
+    def _generate_sequences_impl(self, prompts: DataProto, use_teacher: bool = False):
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
@@ -993,7 +1022,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            weight_source = "teacher" if use_teacher else "actor"
+            loop.run_until_complete(self.rollout_mode(weight_source=weight_source))
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
@@ -1017,6 +1047,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
+        output.meta_info["generation_weight_source"] = "teacher" if use_teacher else "actor"
         output = output.to("cpu")
 
         # clear kv cache
@@ -2023,8 +2054,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
-        await self.rollout_mode()
+    async def wake_up(self, weight_source: str = "actor"):
+        await self.rollout_mode(weight_source=weight_source)
         return True
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)

@@ -196,9 +196,9 @@ class RolloutReplica(ABC):
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
-    async def wake_up(self):
+    async def wake_up(self, weight_source: str = "actor"):
         """Wake up each rollout server."""
-        await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
+        await asyncio.gather(*[server.wake_up.remote(weight_source=weight_source) for server in self.servers])
 
     async def sleep(self):
         """Sleep each rollout server."""

@@ -254,16 +254,26 @@ class SGLangHttpServer:
         self._server_port, self._server_task = await run_unvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
 
-    async def wake_up(self):
+    async def wake_up(self, weight_source: str = "actor"):
+        if weight_source not in {"actor", "teacher"}:
+            raise ValueError(f"Unsupported wake_up weight_source={weight_source}")
         if self.rollout_mode == RolloutMode.HYBRID:
             # Call all workers to switch between trainer mode and rollout mode.
-            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+            await asyncio.gather(*[worker.wake_up.remote(weight_source=weight_source) for worker in self.workers])
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
+            if weight_source == "teacher":
+                raise ValueError(
+                    "Teacher rollout generation is only supported in HYBRID mode, got COLOCATED mode."
+                )
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
+            if weight_source == "teacher":
+                raise ValueError(
+                    "Teacher rollout generation is only supported in HYBRID mode, got STANDALONE mode."
+                )
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):

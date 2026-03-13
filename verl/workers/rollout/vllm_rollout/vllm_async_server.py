@@ -550,15 +550,25 @@ class vLLMHttpServer:
             token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason
         )
 
-    async def wake_up(self):
+    async def wake_up(self, weight_source: str = "actor"):
+        if weight_source not in {"actor", "teacher"}:
+            raise ValueError(f"Unsupported wake_up weight_source={weight_source}")
         if self.rollout_mode == RolloutMode.HYBRID:
             # Call all workers to switch between trainer mode and rollout mode.
-            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+            await asyncio.gather(*[worker.wake_up.remote(weight_source=weight_source) for worker in self.workers])
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             if self.node_rank == 0:
+                if weight_source == "teacher":
+                    raise ValueError(
+                        "Teacher rollout generation is only supported in HYBRID mode, got COLOCATED mode."
+                    )
                 await self.engine.wake_up(tags=["kv_cache", "weights"])
         elif self.rollout_mode == RolloutMode.STANDALONE:
+            if weight_source == "teacher":
+                raise ValueError(
+                    "Teacher rollout generation is only supported in HYBRID mode, got STANDALONE mode."
+                )
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):

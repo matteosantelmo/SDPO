@@ -964,7 +964,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
+    async def wake_up(self, weight_source: str = "actor"):
+        if weight_source != "actor":
+            raise ValueError(
+                "Teacher rollout generation is not supported for megatron async workers. "
+                "Use FSDP hybrid rollout for teacher diagnostics."
+            )
         await self.rollout_mode()
         return True
 

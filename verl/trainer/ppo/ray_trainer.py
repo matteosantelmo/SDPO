@@ -1077,7 +1077,8 @@ class RayPPOTrainer:
                 teacher_batch_and_metrics = self._maybe_build_self_distillation_batch(
                     batch=test_batch,
                     reward_tensor=reward_tensor,
-                    reward_extra_infos_dict=None,
+                    reward_extra_infos_dict=None,   # FIXME: giving None as reward_extra_infos_dict
+                    # means env. feedback will not be collected
                 )
                 if teacher_batch_and_metrics is not None:
                     teacher_batch, _ = teacher_batch_and_metrics
@@ -1103,9 +1104,11 @@ class RayPPOTrainer:
 
                     teacher_gen_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(teacher_gen_batch, size_divisor)
                     if not self.async_rollout_mode:
-                        teacher_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(teacher_gen_batch_padded)
+                        raise NotImplementedError("teacher generation with actor rollout worker is not implemented yet")
                     else:
-                        teacher_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(teacher_gen_batch_padded)
+                        teacher_output_gen_batch_padded = self.async_rollout_manager.generate_sequences_with_teacher(
+                            teacher_gen_batch_padded
+                        )
                     teacher_output_gen_batch = unpad_dataproto(teacher_output_gen_batch_padded, pad_size=teacher_pad_size)
 
                     teacher_prompt_texts = self.tokenizer.batch_decode(

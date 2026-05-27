@@ -133,3 +133,7 @@ outputs
 other_implementation
 Dockerfile.gh200-ofi
 DOCKER_PLAN_GH200.md
+explorations/self_conditioning_kl/runs/*/*.png
+explorations/self_conditioning_kl/runs/*/*.html
+explorations/self_conditioning_kl/runs/*/*.csv
+explorations/self_conditioning_kl/runs/*/*.jsonl
